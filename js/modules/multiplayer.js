@@ -801,7 +801,6 @@
     }
 
     function openBoundGroup() {
-    function openBoundGroup() {
     if (!state.groupId) return;
 
     const group = db.groups.find(
