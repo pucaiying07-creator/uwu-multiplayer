@@ -801,27 +801,48 @@
     }
 
     function openBoundGroup() {
-        if (!state.groupId) return;
+    function openBoundGroup() {
+    if (!state.groupId) return;
 
-        const group =
-            db.groups.find(
-                (g) =>
-                    g.id === state.groupId
-            );
+    const group = db.groups.find(
+        (g) => g.id === state.groupId
+    );
 
-        if (!group) return;
+    if (!group) return;
 
-        closePanel();
+    currentChatId = group.id;
+    currentChatType = 'group';
 
-        if (
-            typeof openChatRoom === 'function'
-        ) {
-            openChatRoom(
-                group.id,
-                'group'
-            );
-        }
+    closePanel();
+
+    if (typeof openChatRoom === 'function') {
+        openChatRoom(group.id, 'group');
+
+        requestAnimationFrame(() => {
+            const wrapper =
+                document.querySelector('.chat-input-wrapper');
+
+            const inputArea =
+                document.getElementById('message-input-default');
+
+            const input =
+                document.getElementById('message-input');
+
+            if (wrapper) {
+                wrapper.style.display = 'block';
+            }
+
+            if (inputArea) {
+                inputArea.style.display = 'flex';
+            }
+
+            if (input) {
+                input.disabled = false;
+                input.placeholder = '输入消息...';
+            }
+        });
     }
+}
 
     async function syncMembers() {
         if (!state.roomId) return;
