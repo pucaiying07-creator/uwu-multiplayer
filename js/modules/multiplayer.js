@@ -1,6 +1,7 @@
-// UwU Multiplayer V1
-// 功能：匿名登录、创建/加入房间、真人成员同步、真人消息实时同步。
-// V2 再接入角色卡 AI 主机与角色卡快照。
+// UwU Multiplayer V2 - Character Presence
+// 功能：真人联机 + 各自本地角色登记/展示。
+// 隐私原则：服务器只保存角色公开身份，不上传角色卡、人设、世界书、私聊或 Tavern 记忆。
+// 本阶段仍禁止联机群里的 AI 生成，下一阶段再接“各自设备只生成自己的角色”。
 
 (() => {
     'use strict';
@@ -22,7 +23,10 @@
 
     let channels = [];
     let scanTimer = null;
+    let characterScanTimer = null;
     let syncingRemote = false;
+    let characterSyncBusy = false;
+    let localCharacterFingerprint = '';
 
     const $ = (id) => document.getElementById(id);
 
@@ -371,7 +375,7 @@
 
         if (connected) {
             setStatus(
-                '已连接。真人消息会实时同步；V1 暂不让 AI 代替真人成员发言。'
+                '已连接。真人消息和角色公开身份会实时同步；角色卡、人设、世界书与私聊仍只保存在各自设备。'
             );
         }
     }
@@ -651,7 +655,7 @@
 
                 multiplayer: {
                     enabled: true,
-                    version: 1,
+                    version: 2,
                     roomId: room.roomId,
                     roomCode: room.roomCode,
                     roomName: room.roomName,
@@ -685,7 +689,7 @@
 
                 enabled: true,
 
-                version: 1,
+                version: 2,
 
                 roomId:
                     room.roomId,
@@ -717,6 +721,7 @@
         persistState();
 
         await syncMembers();
+        await syncCharacters({ pushLocal: true });
         await syncMessages();
         await saveData();
 
@@ -801,31 +806,75 @@
     }
 
     function openBoundGroup() {
-    if (!state.groupId) return;
+        if (!state.groupId) return;
 
-    const group = db.groups.find(
-        (g) => g.id === state.groupId
-    );
+        const group = db.groups.find(
+            (g) => g.id === state.groupId
+        );
 
-    if (!group) return;
+        if (!group) return;
 
-    currentChatId = group.id;
-    currentChatType = 'group';
+        currentChatId = group.id;
+        currentChatType = 'group';
 
-    closePanel();
+        closePanel();
 
-    if (typeof updateCustomBubbleStyle === 'function') {
-        updateCustomBubbleStyle(
-            currentChatId,
-            group.customBubbleCss,
-            group.useCustomBubbleCss
+        if (typeof updateCustomBubbleStyle === 'function') {
+            updateCustomBubbleStyle(
+                currentChatId,
+                group.customBubbleCss,
+                group.useCustomBubbleCss
+            );
+        }
+
+        if (typeof openChatRoom === 'function') {
+            openChatRoom(currentChatId, currentChatType);
+        }
+    }
+
+    function getBoundGroup() {
+        return db.groups.find(
+            (g) => g.id === state.groupId
+        ) || null;
+    }
+
+    function getLocalCharacterMembers(group) {
+        if (!group) return [];
+
+        return (group.members || []).filter((member) => {
+            if (
+                member.isHuman ||
+                member.isRemoteCharacter ||
+                !member.originalCharId
+            ) {
+                return false;
+            }
+
+            return db.characters.some(
+                (char) => char.id === member.originalCharId
+            );
+        });
+    }
+
+    function makeLocalCharacterFingerprint(group) {
+        return JSON.stringify(
+            getLocalCharacterMembers(group)
+                .map((member) => ({
+                    sourceId: String(member.originalCharId),
+                    name:
+                        member.groupNickname ||
+                        member.realName ||
+                        '',
+                    avatar:
+                        member.avatar ||
+                        ''
+                }))
+                .sort((a, b) =>
+                    a.sourceId.localeCompare(b.sourceId)
+                )
         );
     }
 
-    if (typeof openChatRoom === 'function') {
-        openChatRoom(currentChatId, currentChatType);
-    }
-    }
     async function syncMembers() {
         if (!state.roomId) return;
 
@@ -844,50 +893,58 @@
 
         if (error) throw error;
 
-        const group =
-            db.groups.find(
-                (g) =>
-                    g.id === state.groupId
-            );
+        const group = getBoundGroup();
 
         if (!group) return;
 
-        group.members =
+        // 只替换“远程真人”，绝不覆盖本地角色或远程角色。
+        const characterMembers =
+            (group.members || []).filter(
+                (member) => !member.isHuman
+            );
+
+        const remoteHumans =
             (data || [])
                 .filter(
-                    (m) =>
-                        m.user_id !==
+                    (member) =>
+                        member.user_id !==
                         currentUser?.id
                 )
                 .map(
-                    (m) => ({
+                    (member) => ({
                         id:
-                            `human_${m.user_id}`,
+                            `human_${member.user_id}`,
 
                         remoteUserId:
-                            m.user_id,
+                            member.user_id,
 
                         originalCharId:
                             null,
 
                         realName:
-                            m.display_name ||
+                            member.display_name ||
                             '玩家',
 
                         groupNickname:
-                            m.display_name ||
+                            member.display_name ||
                             '玩家',
 
                         persona:
                             '真人联机成员',
 
                         avatar:
-                            m.avatar_url ||
+                            member.avatar_url ||
                             'https://i.postimg.cc/Y96LPskq/o-o-2.jpg',
 
                         isHuman: true,
+                        isRemoteHuman: true,
                     })
                 );
+
+        group.members = [
+            ...characterMembers,
+            ...remoteHumans,
+        ];
 
         await saveData();
 
@@ -904,6 +961,366 @@
         ) {
             renderMessages(false, true);
         }
+    }
+
+    async function syncOwnedCharacters(group) {
+        if (
+            !group ||
+            !state.roomId ||
+            !currentUser?.id
+        ) {
+            return;
+        }
+
+        const localMembers =
+            getLocalCharacterMembers(group);
+
+        const {
+            data: ownedRows,
+            error: readError
+        } = await client
+            .from('room_characters')
+            .select(
+                'id,source_character_id,name,avatar_url,created_by'
+            )
+            .eq(
+                'room_id',
+                state.roomId
+            )
+            .eq(
+                'created_by',
+                currentUser.id
+            );
+
+        if (readError) throw readError;
+
+        const localIds =
+            new Set(
+                localMembers.map(
+                    (member) =>
+                        String(member.originalCharId)
+                )
+            );
+
+        // 角色从本地群里移除后，也从联机房间的公开角色列表移除。
+        for (const row of ownedRows || []) {
+            if (
+                !localIds.has(
+                    String(row.source_character_id)
+                )
+            ) {
+                const {
+                    error: deleteError
+                } = await client
+                    .from('room_characters')
+                    .delete()
+                    .eq(
+                        'id',
+                        row.id
+                    );
+
+                if (deleteError) {
+                    throw deleteError;
+                }
+            }
+        }
+
+        // 只上传公开身份。私密字段由数据库默认值保持为空。
+        for (
+            let index = 0;
+            index < localMembers.length;
+            index += 1
+        ) {
+            const member =
+                localMembers[index];
+
+            const sourceId =
+                String(member.originalCharId);
+
+            const publicName =
+                member.groupNickname ||
+                member.realName ||
+                '角色';
+
+            const {
+                data: upserted,
+                error: upsertError
+            } = await client
+                .from('room_characters')
+                .upsert(
+                    {
+                        room_id:
+                            state.roomId,
+
+                        source_character_id:
+                            sourceId,
+
+                        name:
+                            publicName,
+
+                        avatar_url:
+                            member.avatar ||
+                            null,
+
+                        created_by:
+                            currentUser.id,
+
+                        enabled:
+                            true,
+
+                        sort_order:
+                            index,
+                    },
+                    {
+                        onConflict:
+                            'room_id,created_by,source_character_id'
+                    }
+                )
+                .select(
+                    'id,source_character_id,name,avatar_url,created_by'
+                )
+                .single();
+
+            if (upsertError) {
+                throw upsertError;
+            }
+
+            member.isLocalCharacter = true;
+            member.isRemoteCharacter = false;
+            member.multiplayerCharacterId =
+                upserted?.id ||
+                member.multiplayerCharacterId ||
+                null;
+            member.multiplayerOwnerId =
+                currentUser.id;
+        }
+    }
+
+    async function syncCharacters({
+        pushLocal = false
+    } = {}) {
+        if (
+            !state.roomId ||
+            characterSyncBusy
+        ) {
+            return;
+        }
+
+        characterSyncBusy = true;
+
+        try {
+            const group = getBoundGroup();
+
+            if (!group) return;
+
+            if (pushLocal) {
+                await syncOwnedCharacters(
+                    group
+                );
+            }
+
+            const {
+                data,
+                error
+            } = await client
+                .from('room_characters')
+                .select(
+                    'id,source_character_id,name,avatar_url,created_by,enabled,sort_order'
+                )
+                .eq(
+                    'room_id',
+                    state.roomId
+                )
+                .eq(
+                    'enabled',
+                    true
+                )
+                .order(
+                    'sort_order',
+                    {
+                        ascending: true
+                    }
+                );
+
+            if (error) throw error;
+
+            const ownedRows =
+                new Map(
+                    (data || [])
+                        .filter(
+                            (row) =>
+                                row.created_by ===
+                                currentUser?.id
+                        )
+                        .map(
+                            (row) => [
+                                String(
+                                    row.source_character_id
+                                ),
+                                row
+                            ]
+                        )
+                );
+
+            // 给自己的本地角色补上服务器角色 ID。
+            for (
+                const member of
+                getLocalCharacterMembers(group)
+            ) {
+                const row =
+                    ownedRows.get(
+                        String(
+                            member.originalCharId
+                        )
+                    );
+
+                if (row) {
+                    member.isLocalCharacter = true;
+                    member.isRemoteCharacter = false;
+                    member.multiplayerCharacterId =
+                        row.id;
+                    member.multiplayerOwnerId =
+                        currentUser.id;
+                }
+            }
+
+            const keepLocalAndHumans =
+                (group.members || [])
+                    .filter(
+                        (member) =>
+                            !member.isRemoteCharacter
+                    );
+
+            const remoteCharacters =
+                (data || [])
+                    .filter(
+                        (row) =>
+                            row.created_by !==
+                            currentUser?.id
+                    )
+                    .map(
+                        (row) => ({
+                            id:
+                                `remote_char_${row.id}`,
+
+                            originalCharId:
+                                null,
+
+                            realName:
+                                row.name ||
+                                '远程角色',
+
+                            groupNickname:
+                                row.name ||
+                                '远程角色',
+
+                            persona:
+                                '远程角色。其完整人设、世界书与私聊记忆只保存在拥有者设备上。',
+
+                            avatar:
+                                row.avatar_url ||
+                                'https://i.postimg.cc/fTLCngk1/image.jpg',
+
+                            isHuman:
+                                false,
+
+                            isRemoteCharacter:
+                                true,
+
+                            isLocalCharacter:
+                                false,
+
+                            remoteCharacterId:
+                                row.id,
+
+                            multiplayerCharacterId:
+                                row.id,
+
+                            remoteOwnerId:
+                                row.created_by,
+
+                            multiplayerOwnerId:
+                                row.created_by,
+                        })
+                    );
+
+            group.members = [
+                ...keepLocalAndHumans,
+                ...remoteCharacters,
+            ];
+
+            localCharacterFingerprint =
+                makeLocalCharacterFingerprint(
+                    group
+                );
+
+            await saveData();
+
+            if (
+                typeof renderChatList ===
+                'function'
+            ) {
+                renderChatList();
+            }
+
+            if (
+                currentChatType === 'group' &&
+                currentChatId === group.id
+            ) {
+                if (
+                    typeof renderGroupMembersInSettings ===
+                    'function'
+                ) {
+                    try {
+                        renderGroupMembersInSettings(
+                            group
+                        );
+                    } catch {}
+                }
+
+                if (
+                    typeof renderMessages ===
+                    'function'
+                ) {
+                    renderMessages(
+                        false,
+                        true
+                    );
+                }
+            }
+        } finally {
+            characterSyncBusy = false;
+        }
+    }
+
+    async function scanAndSyncLocalCharacters() {
+        if (
+            !state.connected ||
+            !state.roomId ||
+            !state.groupId
+        ) {
+            return;
+        }
+
+        const group = getBoundGroup();
+
+        if (!group) return;
+
+        const nextFingerprint =
+            makeLocalCharacterFingerprint(
+                group
+            );
+
+        if (
+            nextFingerprint ===
+            localCharacterFingerprint
+        ) {
+            return;
+        }
+
+        await syncCharacters({
+            pushLocal: true
+        });
     }
 
     async function syncMessages() {
@@ -1148,9 +1565,34 @@
                 )
                 .subscribe();
 
+        const characterChannel =
+            client
+                .channel(
+                    `uwu-room-characters-${state.roomId}`
+                )
+                .on(
+                    'postgres_changes',
+                    {
+                        event: '*',
+                        schema: 'public',
+                        table:
+                            'room_characters',
+                        filter:
+                            `room_id=eq.${state.roomId}`
+                    },
+                    () =>
+                        syncCharacters({
+                            pushLocal: false
+                        }).catch(
+                            console.error
+                        )
+                )
+                .subscribe();
+
         channels.push(
             msgChannel,
-            memberChannel
+            memberChannel,
+            characterChannel
         );
     }
 
@@ -1175,6 +1617,12 @@
             clearInterval(scanTimer);
         }
 
+        if (characterScanTimer) {
+            clearInterval(
+                characterScanTimer
+            );
+        }
+
         scanTimer =
             setInterval(
                 () =>
@@ -1183,6 +1631,16 @@
                             console.error
                         ),
                 900
+            );
+
+        characterScanTimer =
+            setInterval(
+                () =>
+                    scanAndSyncLocalCharacters()
+                        .catch(
+                            console.error
+                        ),
+                1200
             );
     }
 
@@ -1306,7 +1764,15 @@
             );
         }
 
+        if (characterScanTimer) {
+            clearInterval(
+                characterScanTimer
+            );
+        }
+
         scanTimer = null;
+        characterScanTimer = null;
+        localCharacterFingerprint = '';
 
         state = {
             roomId: null,
@@ -1351,23 +1817,15 @@
                     return;
                 }
 
-                const aiMembers =
-                    (group.members || [])
-                        .filter(
-                            (m) =>
-                                !m.isHuman
-                        );
+                // V2 这一阶段只验证角色归属和双方可见性。
+                // 在“只生成自己角色”的 AI 链路完成前，
+                // 禁止沿用原版“一次扮演所有群角色”的逻辑。
+                e.preventDefault();
+                e.stopImmediatePropagation();
 
-                if (
-                    aiMembers.length === 0
-                ) {
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-
-                    toast(
-                        '联机 V1 目前只同步真人；角色卡 AI 会在下一版接入。'
-                    );
-                }
+                toast(
+                    '角色联机身份已经接入；AI 回复将在下一步启用，避免现在误替对方角色说话。'
+                );
             },
             true
         );
