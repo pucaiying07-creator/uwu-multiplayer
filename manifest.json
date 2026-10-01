@@ -1,13 +1,13 @@
 {
-  "display_name": "UwU 小手机",
+  "display_name": "UwU 小手机 · 联机版",
   "loading_order": 1,
   "requires": [],
   "optional": [],
   "dependencies": [],
   "js": "st-launcher.js",
   "author": "icedream",
-  "version": "1.0.0",
-  "homePage": "",
+  "version": "1.0.0-multiplayer.1",
+  "homePage": "https://github.com/pucaiying07-creator/uwu-multiplayer",
   "auto_update": false,
   "minimum_client_version": "1.11.0",
   "i18n": {}
