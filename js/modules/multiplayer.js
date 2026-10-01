@@ -825,7 +825,7 @@
     if (typeof openChatRoom === 'function') {
         openChatRoom(currentChatId, currentChatType);
     }
-
+    }
     async function syncMembers() {
         if (!state.roomId) return;
 
