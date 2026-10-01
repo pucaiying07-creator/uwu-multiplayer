@@ -622,3 +622,19 @@
     justify-content: center;
     padding: 0 4px;
 }
+/* 手机浏览器动态视口修复 */
+html,
+body {
+    height: 100dvh;
+    min-height: 0;
+}
+
+.phone-screen {
+    height: 100dvh;
+    min-height: 0;
+}
+
+.screen,
+#chat-room-screen .content {
+    min-height: 0;
+}
