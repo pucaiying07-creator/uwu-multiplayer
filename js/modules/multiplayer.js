@@ -815,31 +815,7 @@
     closePanel();
 
     if (typeof openChatRoom === 'function') {
-        openChatRoom(group.id, 'group');
-
-        requestAnimationFrame(() => {
-            const wrapper =
-                document.querySelector('.chat-input-wrapper');
-
-            const inputArea =
-                document.getElementById('message-input-default');
-
-            const input =
-                document.getElementById('message-input');
-
-            if (wrapper) {
-                wrapper.style.display = 'block';
-            }
-
-            if (inputArea) {
-                inputArea.style.display = 'flex';
-            }
-
-            if (input) {
-                input.disabled = false;
-                input.placeholder = '输入消息...';
-            }
-        });
+        openChatRoom(currentChatId, currentChatType);
     }
 }
 
