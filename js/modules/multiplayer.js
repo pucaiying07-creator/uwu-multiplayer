@@ -1,0 +1,1473 @@
+// UwU Multiplayer V1
+// 功能：匿名登录、创建/加入房间、真人成员同步、真人消息实时同步。
+// V2 再接入角色卡 AI 主机与角色卡快照。
+
+(() => {
+    'use strict';
+
+    const SUPABASE_URL = 'https://thxyacngpdxzsydpgcrf.supabase.co';
+    const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_ZPuQaJKBAneBqVnyaEVfNg__E2jUqhQ';
+    const STORAGE_KEY = 'uwu_multiplayer_session_v1';
+
+    let client = null;
+    let currentUser = null;
+    let state = {
+        roomId: null,
+        roomCode: null,
+        roomName: null,
+        displayName: null,
+        groupId: null,
+        connected: false,
+    };
+
+    let channels = [];
+    let scanTimer = null;
+    let syncingRemote = false;
+
+    const $ = (id) => document.getElementById(id);
+
+    function toast(text) {
+        if (typeof showToast === 'function') showToast(text);
+        else console.log('[Multiplayer]', text);
+    }
+
+    function persistState() {
+        if (state.roomId) {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        } else {
+            localStorage.removeItem(STORAGE_KEY);
+        }
+    }
+
+    function restoreState() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (!raw) return;
+
+            const saved = JSON.parse(raw);
+
+            if (saved && saved.roomId && saved.groupId) {
+                state = {
+                    ...state,
+                    ...saved,
+                    connected: false,
+                };
+            }
+        } catch (e) {
+            console.warn('[Multiplayer] restore state failed', e);
+        }
+    }
+
+    function injectStyles() {
+        if ($('uwu-mp-style')) return;
+
+        const style = document.createElement('style');
+        style.id = 'uwu-mp-style';
+
+        style.textContent = `
+            #uwu-mp-fab{
+                position:fixed;
+                right:16px;
+                bottom:92px;
+                z-index:99990;
+                border:0;
+                border-radius:999px;
+                padding:10px 14px;
+                background:#111;
+                color:#fff;
+                font-size:13px;
+                box-shadow:0 6px 20px rgba(0,0,0,.22);
+            }
+
+            #uwu-mp-fab.connected{
+                background:#2f855a;
+            }
+
+            #uwu-mp-overlay{
+                position:fixed;
+                inset:0;
+                z-index:99998;
+                background:rgba(0,0,0,.42);
+                display:none;
+                align-items:center;
+                justify-content:center;
+                padding:18px;
+                box-sizing:border-box;
+            }
+
+            #uwu-mp-overlay.visible{
+                display:flex;
+            }
+
+            #uwu-mp-card{
+                width:min(92vw,420px);
+                max-height:82vh;
+                overflow:auto;
+                background:#fff;
+                color:#222;
+                border-radius:18px;
+                padding:18px;
+                box-shadow:0 16px 60px rgba(0,0,0,.3);
+                font-family:inherit;
+            }
+
+            #uwu-mp-card h3{
+                margin:0 0 12px;
+                font-size:19px;
+            }
+
+            #uwu-mp-card label{
+                display:block;
+                font-size:12px;
+                color:#666;
+                margin:10px 0 5px;
+            }
+
+            #uwu-mp-card input{
+                width:100%;
+                box-sizing:border-box;
+                padding:11px 12px;
+                border:1px solid #ddd;
+                border-radius:11px;
+                font:inherit;
+                background:#fff;
+                color:#222;
+            }
+
+            .uwu-mp-row{
+                display:flex;
+                gap:8px;
+                margin-top:12px;
+            }
+
+            .uwu-mp-btn{
+                flex:1;
+                border:0;
+                border-radius:11px;
+                padding:11px 12px;
+                font:inherit;
+                background:#111;
+                color:#fff;
+            }
+
+            .uwu-mp-btn.secondary{
+                background:#eee;
+                color:#222;
+            }
+
+            .uwu-mp-btn.danger{
+                background:#b83232;
+                color:#fff;
+            }
+
+            #uwu-mp-status{
+                margin-top:12px;
+                padding:10px;
+                border-radius:10px;
+                background:#f5f5f5;
+                font-size:12px;
+                line-height:1.5;
+                word-break:break-word;
+            }
+
+            #uwu-mp-connected{
+                display:none;
+                margin-top:12px;
+                border-top:1px solid #eee;
+                padding-top:12px;
+            }
+
+            #uwu-mp-connected.visible{
+                display:block;
+            }
+
+            .uwu-mp-code{
+                font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                font-size:20px;
+                font-weight:700;
+                letter-spacing:2px;
+            }
+        `;
+
+        document.head.appendChild(style);
+    }
+
+    function injectUI() {
+        if ($('uwu-mp-fab')) return;
+
+        const fab = document.createElement('button');
+        fab.id = 'uwu-mp-fab';
+        fab.type = 'button';
+        fab.textContent = '联机';
+        fab.addEventListener('click', openPanel);
+        document.body.appendChild(fab);
+
+        const overlay = document.createElement('div');
+        overlay.id = 'uwu-mp-overlay';
+
+        overlay.innerHTML = `
+            <div id="uwu-mp-card">
+                <h3>UwU 联机</h3>
+
+                <label>你的昵称</label>
+                <input
+                    id="uwu-mp-name"
+                    maxlength="24"
+                    placeholder="例如：伶伶"
+                >
+
+                <label>创建房间时的房间名</label>
+                <input
+                    id="uwu-mp-room-name"
+                    maxlength="40"
+                    placeholder="例如：今晚一起聊天"
+                >
+
+                <div class="uwu-mp-row">
+                    <button
+                        class="uwu-mp-btn"
+                        id="uwu-mp-create"
+                        type="button"
+                    >
+                        创建房间
+                    </button>
+                </div>
+
+                <label>加入朋友的房间</label>
+
+                <input
+                    id="uwu-mp-code"
+                    maxlength="12"
+                    placeholder="输入房间码"
+                    autocapitalize="characters"
+                >
+
+                <div class="uwu-mp-row">
+                    <button
+                        class="uwu-mp-btn"
+                        id="uwu-mp-join"
+                        type="button"
+                    >
+                        加入房间
+                    </button>
+                </div>
+
+                <div id="uwu-mp-connected">
+                    <div>
+                        当前房间：
+                        <strong id="uwu-mp-current-room"></strong>
+                    </div>
+
+                    <div style="margin-top:6px">
+                        房间码：
+                        <span
+                            class="uwu-mp-code"
+                            id="uwu-mp-current-code"
+                        ></span>
+                    </div>
+
+                    <div class="uwu-mp-row">
+                        <button
+                            class="uwu-mp-btn secondary"
+                            id="uwu-mp-open-chat"
+                            type="button"
+                        >
+                            打开聊天室
+                        </button>
+
+                        <button
+                            class="uwu-mp-btn danger"
+                            id="uwu-mp-disconnect"
+                            type="button"
+                        >
+                            断开
+                        </button>
+                    </div>
+                </div>
+
+                <div id="uwu-mp-status">
+                    正在初始化联机模块…
+                </div>
+
+                <div class="uwu-mp-row">
+                    <button
+                        class="uwu-mp-btn secondary"
+                        id="uwu-mp-close"
+                        type="button"
+                    >
+                        关闭
+                    </button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        $('uwu-mp-close').addEventListener('click', closePanel);
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                closePanel();
+            }
+        });
+
+        $('uwu-mp-create').addEventListener('click', createRoom);
+        $('uwu-mp-join').addEventListener('click', joinRoom);
+        $('uwu-mp-open-chat').addEventListener('click', openBoundGroup);
+        $('uwu-mp-disconnect').addEventListener('click', disconnectRoom);
+
+        updateUI();
+    }
+
+    function openPanel() {
+        $('uwu-mp-overlay')?.classList.add('visible');
+
+        if ($('uwu-mp-name') && state.displayName) {
+            $('uwu-mp-name').value = state.displayName;
+        }
+
+        updateUI();
+    }
+
+    function closePanel() {
+        $('uwu-mp-overlay')?.classList.remove('visible');
+    }
+
+    function setStatus(text, isError = false) {
+        const el = $('uwu-mp-status');
+
+        if (!el) return;
+
+        el.textContent = text;
+        el.style.background = isError ? '#fff0f0' : '#f5f5f5';
+        el.style.color = isError ? '#a11' : '#333';
+    }
+
+    function updateUI() {
+        const connected = !!state.roomId && state.connected;
+        const fab = $('uwu-mp-fab');
+
+        if (fab) {
+            fab.classList.toggle('connected', connected);
+            fab.textContent = connected
+                ? `联机·${state.roomCode || ''}`
+                : '联机';
+        }
+
+        $('uwu-mp-connected')?.classList.toggle(
+            'visible',
+            !!state.roomId
+        );
+
+        if ($('uwu-mp-current-room')) {
+            $('uwu-mp-current-room').textContent =
+                state.roomName || 'UwU 联机房间';
+        }
+
+        if ($('uwu-mp-current-code')) {
+            $('uwu-mp-current-code').textContent =
+                state.roomCode || '';
+        }
+
+        if (connected) {
+            setStatus(
+                '已连接。真人消息会实时同步；V1 暂不让 AI 代替真人成员发言。'
+            );
+        }
+    }
+
+    async function waitForUwUReady(timeoutMs = 20000) {
+        const started = Date.now();
+
+        while (Date.now() - started < timeoutMs) {
+            const hasDexie =
+                typeof dexieDB !== 'undefined' &&
+                dexieDB &&
+                (!dexieDB.isOpen || dexieDB.isOpen());
+
+            const loginOverlay =
+                document.getElementById('login-overlay');
+
+            if (
+                hasDexie &&
+                !loginOverlay &&
+                typeof saveData === 'function' &&
+                Array.isArray(db?.groups)
+            ) {
+                await new Promise((resolve) =>
+                    setTimeout(resolve, 500)
+                );
+
+                return true;
+            }
+
+            await new Promise((resolve) =>
+                setTimeout(resolve, 200)
+            );
+        }
+
+        throw new Error(
+            'UwU 本地数据还没有初始化，请先完成原版登录'
+        );
+    }
+
+    async function ensureAuth() {
+        if (!client) {
+            throw new Error('Supabase 客户端未初始化');
+        }
+
+        const {
+            data: { session },
+            error
+        } = await client.auth.getSession();
+
+        if (error) throw error;
+
+        if (session?.user) {
+            currentUser = session.user;
+            return currentUser;
+        }
+
+        const {
+            data,
+            error: signError
+        } = await client.auth.signInAnonymously();
+
+        if (signError) throw signError;
+
+        currentUser =
+            data.user ||
+            data.session?.user;
+
+        if (!currentUser) {
+            throw new Error('匿名登录失败');
+        }
+
+        return currentUser;
+    }
+
+    function getDisplayName() {
+        const value =
+            $('uwu-mp-name')?.value?.trim();
+
+        return (
+            value ||
+            state.displayName ||
+            '玩家'
+        );
+    }
+
+    async function createRoom() {
+        try {
+            setStatus('正在创建房间…');
+
+            await ensureAuth();
+            await waitForUwUReady();
+
+            const displayName =
+                getDisplayName();
+
+            const roomName =
+                $('uwu-mp-room-name')?.value?.trim() ||
+                'UwU 联机房间';
+
+            const {
+                data,
+                error
+            } = await client.rpc(
+                'create_multiplayer_room',
+                {
+                    p_name: roomName,
+                    p_display_name: displayName,
+                }
+            );
+
+            if (error) throw error;
+
+            const row =
+                Array.isArray(data)
+                    ? data[0]
+                    : data;
+
+            if (!row?.room_id) {
+                throw new Error(
+                    '创建房间后没有返回 room_id'
+                );
+            }
+
+            await bindRoom({
+                roomId: row.room_id,
+                roomCode: row.room_code,
+                roomName: row.room_name,
+                displayName,
+            });
+
+            toast(`房间已创建：${row.room_code}`);
+
+            openBoundGroup();
+
+        } catch (e) {
+            console.error(
+                '[Multiplayer] create room failed',
+                e
+            );
+
+            setStatus(
+                `创建失败：${e.message || e}`,
+                true
+            );
+        }
+    }
+
+    async function joinRoom() {
+        try {
+            setStatus('正在加入房间…');
+
+            await ensureAuth();
+            await waitForUwUReady();
+
+            const displayName =
+                getDisplayName();
+
+            const code =
+                $('uwu-mp-code')
+                    ?.value
+                    ?.trim()
+                    .toUpperCase();
+
+            if (!code) {
+                throw new Error('请输入房间码');
+            }
+
+            const {
+                data,
+                error
+            } = await client.rpc(
+                'join_multiplayer_room',
+                {
+                    p_room_code: code,
+                    p_display_name: displayName,
+                }
+            );
+
+            if (error) throw error;
+
+            const row =
+                Array.isArray(data)
+                    ? data[0]
+                    : data;
+
+            if (!row?.room_id) {
+                throw new Error(
+                    '房间不存在或无法加入'
+                );
+            }
+
+            await bindRoom({
+                roomId: row.room_id,
+                roomCode: row.room_code,
+                roomName: row.room_name,
+                displayName,
+            });
+
+            toast(`已加入房间：${row.room_code}`);
+
+            openBoundGroup();
+
+        } catch (e) {
+            console.error(
+                '[Multiplayer] join room failed',
+                e
+            );
+
+            setStatus(
+                `加入失败：${e.message || e}`,
+                true
+            );
+        }
+    }
+
+    function makeGroup(room) {
+        const groupId =
+            `mp_${room.roomId}`;
+
+        let group = db.groups.find(
+            (g) =>
+                g.id === groupId ||
+                g.multiplayer?.roomId === room.roomId
+        );
+
+        if (!group) {
+            group = {
+                id: groupId,
+
+                name:
+                    room.roomName ||
+                    'UwU 联机房间',
+
+                avatar:
+                    'https://i.postimg.cc/fTLCngk1/image.jpg',
+
+                me: {
+                    nickname:
+                        room.displayName ||
+                        '玩家',
+
+                    persona: '',
+
+                    avatar:
+                        'https://i.postimg.cc/GtbTnxhP/o-o-1.jpg',
+
+                    remoteUserId:
+                        currentUser?.id ||
+                        null,
+
+                    isHuman: true,
+                },
+
+                members: [],
+
+                theme: 'white_pink',
+
+                maxMemory: 100,
+
+                chatBg: '',
+
+                history: [],
+
+                isPinned: false,
+
+                unreadCount: 0,
+
+                useCustomBubbleCss: false,
+
+                customBubbleCss: '',
+
+                worldBookIds: [],
+
+                allowGossip: false,
+
+                privateSessions: {},
+
+                multiplayer: {
+                    enabled: true,
+                    version: 1,
+                    roomId: room.roomId,
+                    roomCode: room.roomCode,
+                    roomName: room.roomName,
+                }
+            };
+
+            db.groups.push(group);
+
+        } else {
+            group.name =
+                room.roomName ||
+                group.name;
+
+            group.me =
+                group.me || {};
+
+            group.me.nickname =
+                room.displayName ||
+                group.me.nickname ||
+                '玩家';
+
+            group.me.remoteUserId =
+                currentUser?.id ||
+                group.me.remoteUserId ||
+                null;
+
+            group.me.isHuman = true;
+
+            group.multiplayer = {
+                ...(group.multiplayer || {}),
+
+                enabled: true,
+
+                version: 1,
+
+                roomId:
+                    room.roomId,
+
+                roomCode:
+                    room.roomCode,
+
+                roomName:
+                    room.roomName,
+            };
+        }
+
+        return group;
+    }
+
+    async function bindRoom(room) {
+        await unsubscribeAll();
+
+        const group =
+            makeGroup(room);
+
+        state = {
+            ...state,
+            ...room,
+            groupId: group.id,
+            connected: true,
+        };
+
+        persistState();
+
+        await syncMembers();
+        await syncMessages();
+        await saveData();
+
+        if (
+            typeof renderChatList === 'function'
+        ) {
+            renderChatList();
+        }
+
+        subscribeRealtime();
+        startLocalMessageScanner();
+        updateUI();
+    }
+
+    async function resumeSavedRoom() {
+        if (
+            !state.roomId ||
+            !state.groupId
+        ) {
+            return;
+        }
+
+        try {
+            await ensureAuth();
+            await waitForUwUReady();
+
+            const {
+                data: roomRows,
+                error
+            } = await client
+                .from('rooms')
+                .select(
+                    'id,room_code,name'
+                )
+                .eq(
+                    'id',
+                    state.roomId
+                )
+                .limit(1);
+
+            if (error) throw error;
+
+            const room =
+                roomRows?.[0];
+
+            if (!room) {
+                throw new Error(
+                    '保存的房间已不可访问'
+                );
+            }
+
+            await bindRoom({
+                roomId:
+                    room.id,
+
+                roomCode:
+                    room.room_code,
+
+                roomName:
+                    room.name,
+
+                displayName:
+                    state.displayName ||
+                    '玩家',
+            });
+
+        } catch (e) {
+            console.warn(
+                '[Multiplayer] resume failed',
+                e
+            );
+
+            state.connected = false;
+
+            updateUI();
+
+            setStatus(
+                `未能恢复上次联机：${e.message || e}`,
+                true
+            );
+        }
+    }
+
+    function openBoundGroup() {
+        if (!state.groupId) return;
+
+        const group =
+            db.groups.find(
+                (g) =>
+                    g.id === state.groupId
+            );
+
+        if (!group) return;
+
+        closePanel();
+
+        if (
+            typeof openChatRoom === 'function'
+        ) {
+            openChatRoom(
+                group.id,
+                'group'
+            );
+        }
+    }
+
+    async function syncMembers() {
+        if (!state.roomId) return;
+
+        const {
+            data,
+            error
+        } = await client
+            .from('room_members')
+            .select(
+                'user_id,display_name,avatar_url,joined_at,last_seen'
+            )
+            .eq(
+                'room_id',
+                state.roomId
+            );
+
+        if (error) throw error;
+
+        const group =
+            db.groups.find(
+                (g) =>
+                    g.id === state.groupId
+            );
+
+        if (!group) return;
+
+        group.members =
+            (data || [])
+                .filter(
+                    (m) =>
+                        m.user_id !==
+                        currentUser?.id
+                )
+                .map(
+                    (m) => ({
+                        id:
+                            `human_${m.user_id}`,
+
+                        remoteUserId:
+                            m.user_id,
+
+                        originalCharId:
+                            null,
+
+                        realName:
+                            m.display_name ||
+                            '玩家',
+
+                        groupNickname:
+                            m.display_name ||
+                            '玩家',
+
+                        persona:
+                            '真人联机成员',
+
+                        avatar:
+                            m.avatar_url ||
+                            'https://i.postimg.cc/Y96LPskq/o-o-2.jpg',
+
+                        isHuman: true,
+                    })
+                );
+
+        await saveData();
+
+        if (
+            typeof renderChatList === 'function'
+        ) {
+            renderChatList();
+        }
+
+        if (
+            currentChatType === 'group' &&
+            currentChatId === group.id &&
+            typeof renderMessages === 'function'
+        ) {
+            renderMessages(false, true);
+        }
+    }
+
+    async function syncMessages() {
+        if (!state.roomId) return;
+
+        const {
+            data,
+            error
+        } = await client
+            .from('messages')
+            .select(
+                'id,client_message_id,sender_kind,sender_user_id,sender_name,message_type,content,payload,created_at'
+            )
+            .eq(
+                'room_id',
+                state.roomId
+            )
+            .order(
+                'created_at',
+                {
+                    ascending: true
+                }
+            )
+            .limit(500);
+
+        if (error) throw error;
+
+        for (
+            const row of data || []
+        ) {
+            await applyRemoteMessage(
+                row,
+                false
+            );
+        }
+
+        await saveData();
+
+        if (
+            typeof renderChatList === 'function'
+        ) {
+            renderChatList();
+        }
+
+        if (
+            currentChatType === 'group' &&
+            currentChatId === state.groupId &&
+            typeof renderMessages === 'function'
+        ) {
+            renderMessages(false, true);
+        }
+    }
+
+    async function applyRemoteMessage(
+        row,
+        live = true
+    ) {
+        const group =
+            db.groups.find(
+                (g) =>
+                    g.id === state.groupId
+            );
+
+        if (
+            !group ||
+            !row?.client_message_id
+        ) {
+            return;
+        }
+
+        if (
+            group.history.some(
+                (m) =>
+                    m.id ===
+                        row.client_message_id ||
+                    m.multiplayerServerId ===
+                        row.id
+            )
+        ) {
+            return;
+        }
+
+        if (
+            row.sender_kind !== 'human'
+        ) {
+            return;
+        }
+
+        const isMine =
+            row.sender_user_id ===
+            currentUser?.id;
+
+        if (
+            !isMine &&
+            !group.members.some(
+                (m) =>
+                    m.remoteUserId ===
+                    row.sender_user_id
+            )
+        ) {
+            await syncMembers();
+        }
+
+        const message = {
+            id:
+                row.client_message_id,
+
+            role:
+                isMine
+                    ? 'user'
+                    : 'assistant',
+
+            content:
+                row.content || '',
+
+            parts: [
+                {
+                    type:
+                        row.message_type ||
+                        'text',
+
+                    text:
+                        row.content ||
+                        ''
+                }
+            ],
+
+            timestamp:
+                row.created_at
+                    ? new Date(
+                        row.created_at
+                    ).getTime()
+                    : Date.now(),
+
+            senderId:
+                isMine
+                    ? 'user_me'
+                    : `human_${row.sender_user_id}`,
+
+            multiplayerServerId:
+                row.id,
+
+            multiplayerRemote:
+                !isMine,
+
+            multiplayerSenderKind:
+                'human',
+        };
+
+        syncingRemote = true;
+
+        try {
+            group.history.push(
+                message
+            );
+
+            if (
+                live &&
+                typeof addMessageBubble ===
+                    'function'
+            ) {
+                addMessageBubble(
+                    message,
+                    group.id,
+                    'group'
+                );
+            }
+
+            await saveData();
+
+            if (
+                typeof renderChatList ===
+                'function'
+            ) {
+                renderChatList();
+            }
+
+        } finally {
+            syncingRemote = false;
+        }
+    }
+
+    function subscribeRealtime() {
+        if (!state.roomId) return;
+
+        const msgChannel =
+            client
+                .channel(
+                    `uwu-room-msg-${state.roomId}`
+                )
+                .on(
+                    'postgres_changes',
+                    {
+                        event: 'INSERT',
+                        schema: 'public',
+                        table: 'messages',
+                        filter:
+                            `room_id=eq.${state.roomId}`
+                    },
+                    (payload) =>
+                        applyRemoteMessage(
+                            payload.new,
+                            true
+                        ).catch(
+                            console.error
+                        )
+                )
+                .subscribe(
+                    (status) => {
+                        if (
+                            status ===
+                            'SUBSCRIBED'
+                        ) {
+                            state.connected =
+                                true;
+
+                            persistState();
+                            updateUI();
+                        }
+                    }
+                );
+
+        const memberChannel =
+            client
+                .channel(
+                    `uwu-room-members-${state.roomId}`
+                )
+                .on(
+                    'postgres_changes',
+                    {
+                        event: '*',
+                        schema: 'public',
+                        table:
+                            'room_members',
+                        filter:
+                            `room_id=eq.${state.roomId}`
+                    },
+                    () =>
+                        syncMembers().catch(
+                            console.error
+                        )
+                )
+                .subscribe();
+
+        channels.push(
+            msgChannel,
+            memberChannel
+        );
+    }
+
+    async function unsubscribeAll() {
+        if (!client) return;
+
+        for (
+            const channel of channels
+        ) {
+            try {
+                await client.removeChannel(
+                    channel
+                );
+            } catch {}
+        }
+
+        channels = [];
+    }
+
+    function startLocalMessageScanner() {
+        if (scanTimer) {
+            clearInterval(scanTimer);
+        }
+
+        scanTimer =
+            setInterval(
+                () =>
+                    scanAndPushLocalMessages()
+                        .catch(
+                            console.error
+                        ),
+                900
+            );
+    }
+
+    async function scanAndPushLocalMessages() {
+        if (
+            !state.connected ||
+            !state.roomId ||
+            !state.groupId ||
+            syncingRemote
+        ) {
+            return;
+        }
+
+        const group =
+            db.groups.find(
+                (g) =>
+                    g.id === state.groupId
+            );
+
+        if (
+            !group?.history?.length
+        ) {
+            return;
+        }
+
+        const candidates =
+            group.history.filter(
+                (m) =>
+                    m.role === 'user' &&
+                    m.id &&
+                    !m.multiplayerSynced &&
+                    !m.fromTavern &&
+                    m.role !== 'system'
+            );
+
+        if (!candidates.length) {
+            return;
+        }
+
+        for (
+            const msg of candidates
+        ) {
+            const {
+                error
+            } = await client
+                .from('messages')
+                .insert({
+                    room_id:
+                        state.roomId,
+
+                    client_message_id:
+                        msg.id,
+
+                    sender_kind:
+                        'human',
+
+                    sender_user_id:
+                        currentUser.id,
+
+                    sender_name:
+                        group.me?.nickname ||
+                        state.displayName ||
+                        '玩家',
+
+                    message_type:
+                        msg.parts?.[0]?.type ||
+                        'text',
+
+                    content:
+                        msg.content ||
+                        '',
+
+                    payload: {
+                        quote:
+                            msg.quote ||
+                            null,
+
+                        storyTime:
+                            msg.storyTime ||
+                            null,
+                    },
+                });
+
+            if (error) {
+                if (
+                    String(error.code) ===
+                    '23505'
+                ) {
+                    msg.multiplayerSynced =
+                        true;
+
+                    continue;
+                }
+
+                console.error(
+                    '[Multiplayer] push message failed',
+                    error
+                );
+
+                setStatus(
+                    `消息同步失败：${error.message || error}`,
+                    true
+                );
+
+                return;
+            }
+
+            msg.multiplayerSynced =
+                true;
+
+            await saveData();
+        }
+    }
+
+    async function disconnectRoom() {
+        await unsubscribeAll();
+
+        if (scanTimer) {
+            clearInterval(
+                scanTimer
+            );
+        }
+
+        scanTimer = null;
+
+        state = {
+            roomId: null,
+            roomCode: null,
+            roomName: null,
+            displayName: null,
+            groupId: null,
+            connected: false
+        };
+
+        persistState();
+        updateUI();
+
+        setStatus(
+            '已断开联机。本地聊天记录不会删除。'
+        );
+    }
+
+    function blockAiForHumanOnlyRoom() {
+        document.addEventListener(
+            'click',
+            (e) => {
+                const btn =
+                    e.target?.closest?.(
+                        '#get-reply-btn, #regenerate-btn'
+                    );
+
+                if (!btn) return;
+
+                const group =
+                    currentChatType === 'group'
+                        ? db.groups.find(
+                            (g) =>
+                                g.id ===
+                                currentChatId
+                        )
+                        : null;
+
+                if (
+                    !group?.multiplayer?.enabled
+                ) {
+                    return;
+                }
+
+                const aiMembers =
+                    (group.members || [])
+                        .filter(
+                            (m) =>
+                                !m.isHuman
+                        );
+
+                if (
+                    aiMembers.length === 0
+                ) {
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+
+                    toast(
+                        '联机 V1 目前只同步真人；角色卡 AI 会在下一版接入。'
+                    );
+                }
+            },
+            true
+        );
+    }
+
+    async function init() {
+        injectStyles();
+        injectUI();
+
+        restoreState();
+        updateUI();
+
+        if (
+            !window.supabase?.createClient
+        ) {
+            setStatus(
+                'Supabase JS 没有加载成功，请检查网络。',
+                true
+            );
+
+            return;
+        }
+
+        client =
+            window.supabase.createClient(
+                SUPABASE_URL,
+                SUPABASE_PUBLISHABLE_KEY,
+                {
+                    auth: {
+                        persistSession: true,
+                        autoRefreshToken: true,
+                        detectSessionInUrl: false
+                    }
+                }
+            );
+
+        try {
+            await ensureAuth();
+
+            setStatus(
+                '联机服务已就绪。可以创建或加入房间。'
+            );
+
+            if (state.roomId) {
+                await resumeSavedRoom();
+            }
+
+        } catch (e) {
+            console.error(
+                '[Multiplayer] init auth failed',
+                e
+            );
+
+            setStatus(
+                `联机初始化失败：${e.message || e}。请确认 Supabase 已开启 Anonymous Sign-Ins。`,
+                true
+            );
+        }
+
+        blockAiForHumanOnlyRoom();
+    }
+
+    window.MultiplayerSync = {
+        get client() {
+            return client;
+        },
+
+        get user() {
+            return currentUser;
+        },
+
+        get state() {
+            return {
+                ...state
+            };
+        },
+
+        open:
+            openPanel,
+
+        createRoom,
+
+        joinRoom,
+
+        disconnectRoom,
+
+        syncMembers,
+
+        syncMessages,
+    };
+
+    if (
+        document.readyState ===
+        'loading'
+    ) {
+        document.addEventListener(
+            'DOMContentLoaded',
+            init
+        );
+    } else {
+        setTimeout(
+            init,
+            0
+        );
+    }
+})();
