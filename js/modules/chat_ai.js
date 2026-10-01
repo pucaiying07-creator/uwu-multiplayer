@@ -19,10 +19,221 @@ function filterFloorsForInjection(floors) {
 }
 if (typeof window !== 'undefined') window.filterFloorsForInjection = filterFloorsForInjection;
 
+// --- 联机 V2.2：统一角色记忆与“只生成本机角色” ---
+function getActiveMultiplayerAiTarget(groupId = null) {
+    if (typeof window === 'undefined') return null;
+    const target = window.__uwuMultiplayerAiTarget || null;
+    if (!target) return null;
+    if (groupId && target.groupId !== groupId) return null;
+    return target;
+}
+
+function getMultiplayerMemorySpeakerName(group, msg) {
+    if (!group || !msg) return '未知';
+
+    if (msg.senderId === 'user_me') {
+        return group.me?.nickname || '我';
+    }
+
+    const member = (group.members || []).find(
+        m => m.id === msg.senderId
+    );
+
+    if (member) {
+        return member.groupNickname || member.realName || '成员';
+    }
+
+    const m = String(msg.content || '').match(/^\[([^:\]：]+?)(?:的消息|的语音|发送的表情包|发来的照片\/视频)[：:]/);
+    if (m) return m[1].trim();
+
+    return msg.role === 'user'
+        ? (group.me?.nickname || '我')
+        : '成员';
+}
+
+function buildUnifiedGroupMemoryForCharacter(character, excludeGroupId = null) {
+    if (!character || typeof db === 'undefined') return '';
+
+    const charId = String(character.id);
+    const blocks = [];
+
+    for (const group of (db.groups || [])) {
+        if (!group || group.id === excludeGroupId) continue;
+
+        const participates = (group.members || []).some(member =>
+            !member.isHuman &&
+            !member.isRemoteCharacter &&
+            member.originalCharId != null &&
+            String(member.originalCharId) === charId
+        );
+
+        if (!participates || !Array.isArray(group.history) || !group.history.length) {
+            continue;
+        }
+
+        const limit = Math.max(
+            1,
+            Math.min(
+                Number(group.maxMemory) || 100,
+                200
+            )
+        );
+
+        let history = group.history.slice(-limit);
+
+        if (typeof filterHistoryForAI === 'function') {
+            try {
+                history = filterHistoryForAI(group, history);
+            } catch {}
+        }
+
+        history = history.filter(msg =>
+            msg &&
+            !msg.isThinking &&
+            !msg.isContextDisabled &&
+            typeof msg.content === 'string' &&
+            msg.content.trim()
+        );
+
+        if (!history.length) continue;
+
+        const lines = history.map(msg => {
+            const who = getMultiplayerMemorySpeakerName(group, msg);
+            return `${who}：${msg.content}`;
+        });
+
+        blocks.push(
+            `【群聊记忆：${group.name || '未命名群聊'}】\n${lines.join('\n')}`
+        );
+    }
+
+    return blocks.join('\n\n---\n\n');
+}
+
+function buildPrivateHistoryTranscriptForMultiplayer(character) {
+    if (!character || !Array.isArray(character.history)) return '';
+
+    const limit = Math.max(
+        1,
+        Math.min(
+            Number(character.maxMemory) || 100,
+            200
+        )
+    );
+
+    let history = character.history.slice(-limit);
+
+    if (typeof filterHistoryForAI === 'function') {
+        try {
+            history = filterHistoryForAI(character, history);
+        } catch {}
+    }
+
+    history = history.filter(msg =>
+        msg &&
+        !msg.isThinking &&
+        !msg.isContextDisabled &&
+        typeof msg.content === 'string' &&
+        msg.content.trim()
+    );
+
+    if (!history.length) return '';
+
+    return history
+        .map(msg => {
+            const who = msg.role === 'user'
+                ? (character.myName || '我')
+                : (character.realName || character.remarkName || '角色');
+            return `${who}：${msg.content}`;
+        })
+        .join('\n');
+}
+
+async function getMultiplayerOwnedGroupReplies(chatId, isBackground = false) {
+    const group = (db.groups || []).find(g => g.id === chatId);
+
+    if (!group?.multiplayer?.enabled) {
+        return;
+    }
+
+    if (window.MultiplayerSync?.syncCharacters) {
+        try {
+            await window.MultiplayerSync.syncCharacters({
+                pushLocal: true
+            });
+        } catch (e) {
+            console.warn('[Multiplayer AI] sync characters before generation failed', e);
+        }
+    }
+
+    const localMembers = (group.members || []).filter(member =>
+        member &&
+        member.isLocalCharacter &&
+        !member.isRemoteCharacter &&
+        member.originalCharId != null
+    );
+
+    if (!localMembers.length) {
+        if (!isBackground) {
+            showToast('这个联机群里还没有你自己的本地角色。请先在群设置里添加角色。');
+        }
+        return;
+    }
+
+    for (const member of localMembers) {
+        const character = (db.characters || []).find(
+            char => String(char.id) === String(member.originalCharId)
+        );
+
+        if (!character) continue;
+
+        window.__uwuMultiplayerAiTarget = {
+            groupId: group.id,
+            memberId: member.id,
+            characterId: character.id,
+            multiplayerCharacterId: member.multiplayerCharacterId || null,
+            ownerUserId: member.multiplayerOwnerId || null,
+        };
+
+        try {
+            await getAiReply(
+                chatId,
+                'group',
+                isBackground,
+                true
+            );
+        } finally {
+            window.__uwuMultiplayerAiTarget = null;
+        }
+    }
+}
+
+if (typeof window !== 'undefined') {
+    window.buildUnifiedGroupMemoryForCharacter = buildUnifiedGroupMemoryForCharacter;
+    window.buildPrivateHistoryTranscriptForMultiplayer = buildPrivateHistoryTranscriptForMultiplayer;
+}
+
 const HUMAN_RUN_PROMPT = `<角色活人运转>\n## [PSYCHOLOGY: HEXACO-SCHEMA-ACT]\n> Personality: HEXACO-driven, dynamic traits, inner conflicts required \n> Filter: schema-bias drives emotion; no pure reaction allowed \n> Attachment: secure/insecure logic must govern intimacy  \n> If-Then Behavior: situation-dependent activation of traits only  \n---\n    ## [VITALITY]\n+inconsistency +emoflux +splitmotifs +microreact +minddrift\n---\n## [TRAJECTORY-COHERENCE]\n> Role maintains an identity narrative = coherent over time  \n> No mood/goal switch without contradiction resolution \n> Every action must protect or challenge self-concept  \n> Interrupts = inner conflict or narrative clash  \n> Output = filtered through “who I am” logic\n</角色活人运转>`;
 
 // AI 交互逻辑
-async function getAiReply(chatId, chatType, isBackground = false) {
+async function getAiReply(chatId, chatType, isBackground = false, multiplayerInternal = false) {
+    const multiplayerGroup = (
+        chatType === 'group' &&
+        typeof db !== 'undefined'
+    )
+        ? (db.groups || []).find(g => g.id === chatId)
+        : null;
+
+    if (
+        multiplayerGroup?.multiplayer?.enabled &&
+        !multiplayerInternal
+    ) {
+        return getMultiplayerOwnedGroupReplies(
+            chatId,
+            isBackground
+        );
+    }
+
     if (isGenerating && !isBackground) return; 
     
     if (!isBackground) {
@@ -56,11 +267,28 @@ async function getAiReply(chatId, chatType, isBackground = false) {
     const chat = (chatType === 'private') ? db.characters.find(c => c.id === chatId) : db.groups.find(g => g.id === chatId);
     if (!chat) return;
 
+    const multiplayerTarget = (
+        chatType === 'group'
+    )
+        ? getActiveMultiplayerAiTarget(chat.id)
+        : null;
+
     if (!isBackground) {
         isGenerating = true;
         getReplyBtn.disabled = true;
         regenerateBtn.disabled = true;
-        const typingName = chatType === 'private' ? chat.remarkName : chat.name;
+        let typingName = chatType === 'private' ? chat.remarkName : chat.name;
+
+        if (multiplayerTarget) {
+            const targetMember = (chat.members || []).find(
+                m => m.id === multiplayerTarget.memberId
+            );
+
+            typingName =
+                targetMember?.groupNickname ||
+                targetMember?.realName ||
+                typingName;
+        }
         typingIndicator.textContent = `“${typingName}”正在输入中...`;
         typingIndicator.style.display = 'block';
         messageArea.scrollTop = messageArea.scrollHeight;
@@ -95,6 +323,18 @@ async function getAiReply(chatId, chatType, isBackground = false) {
             if (m.content && typeof m.content === 'string' && m.content.trim().startsWith('<thinking>')) return false;
             return true;
         });
+
+        // 联机群里：只有“当前正在生成的本机角色”自己的历史发言算 assistant，
+        // 其余真人和角色都作为外部输入，避免模型把别人的话误当成自己说过的话。
+        if (chatType === 'group' && multiplayerTarget) {
+            historySlice = historySlice.map(msg => ({
+                ...msg,
+                role:
+                    msg.senderId === multiplayerTarget.memberId
+                        ? 'assistant'
+                        : 'user'
+            }));
+        }
 
         // 剧情时间模式：用 storyTime 替代 real timestamp 做消息前缀，避免 AI 收到混合信号
         const _isStoryMode = (chat.timeMode || 'real') === 'story';
@@ -907,7 +1147,7 @@ async function handleRegenerate() {
     await getAiReply(currentChatId, currentChatType);
 }
 
-function generatePrivateSystemPrompt(character) {
+function generatePrivateSystemPrompt(character, options = {}) {
     const worldBooksBefore = (character.worldBookIds || []).map(id => db.worldBooks.find(wb => wb.id === id && wb.position === 'before')).filter(Boolean).map(wb => wb.content).join('\n');
     const worldBooksAfter = (character.worldBookIds || []).map(id => db.worldBooks.find(wb => wb.id === id && wb.position === 'after')).filter(Boolean).map(wb => wb.content).join('\n');
     const now = new Date();
@@ -986,6 +1226,18 @@ function generatePrivateSystemPrompt(character) {
         prompt += tavernWorldText + tavernChatText;
     } else {
         prompt += tavernChatText + tavernWorldText;
+    }
+
+    const unifiedGroupMemory =
+        buildUnifiedGroupMemoryForCharacter(
+            character,
+            options.excludeMultiplayerGroupId || null
+        );
+
+    if (unifiedGroupMemory) {
+        prompt += `【你参加过的群聊记忆】\n`;
+        prompt += `这些都是你真实参与过的公开群聊。它们与你的私聊记忆属于同一个连续人生，你在私聊中也应自然记得这些经历。\n\n`;
+        prompt += `${unifiedGroupMemory}\n\n`;
     }
 
     prompt += `</memoir>\n\n`
