@@ -814,40 +814,18 @@
 
     closePanel();
 
+    if (typeof updateCustomBubbleStyle === 'function') {
+        updateCustomBubbleStyle(
+            currentChatId,
+            group.customBubbleCss,
+            group.useCustomBubbleCss
+        );
+    }
+
     if (typeof openChatRoom === 'function') {
         openChatRoom(currentChatId, currentChatType);
     }
 
-    const revealInput = () => {
-        const screen =
-            document.getElementById('chat-room-screen');
-
-        const wrapper =
-            screen?.querySelector('.chat-input-wrapper');
-
-        const inputArea =
-            document.getElementById('message-input-default');
-
-        const input =
-            document.getElementById('message-input');
-
-        if (wrapper) {
-            wrapper.style.display = 'block';
-        }
-
-        if (inputArea) {
-            inputArea.style.display = 'flex';
-        }
-
-        if (input) {
-            input.disabled = false;
-            input.readOnly = false;
-        }
-    };
-
-    requestAnimationFrame(revealInput);
-    setTimeout(revealInput, 150);
-}
     async function syncMembers() {
         if (!state.roomId) return;
 
