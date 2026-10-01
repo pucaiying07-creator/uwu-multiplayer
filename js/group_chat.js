@@ -1195,7 +1195,181 @@ function sendRenameNotification(group, newName) {
     group.history.push(message);
 }
 
+function generateMultiplayerCharacterSystemPrompt(group, target) {
+    const member = (group.members || []).find(
+        m => m.id === target?.memberId
+    );
+
+    if (!member || member.originalCharId == null) {
+        return '联机角色生成目标不存在。';
+    }
+
+    const character = (db.characters || []).find(
+        char =>
+            String(char.id) ===
+            String(member.originalCharId)
+    );
+
+    if (!character) {
+        return '本机没有找到该角色的完整角色卡。';
+    }
+
+    let prompt;
+
+    if (typeof generatePrivateSystemPrompt === 'function') {
+        prompt = generatePrivateSystemPrompt(
+            character,
+            {
+                excludeMultiplayerGroupId:
+                    group.id
+            }
+        );
+    } else {
+        prompt = `你正在扮演 ${character.realName || member.realName}。`;
+    }
+
+    const privateHistory = (
+        typeof window !== 'undefined' &&
+        typeof window.buildPrivateHistoryTranscriptForMultiplayer === 'function'
+    )
+        ? window.buildPrivateHistoryTranscriptForMultiplayer(character)
+        : '';
+
+    const otherParticipants = [];
+
+    if (group.me) {
+        otherParticipants.push(
+            `- 真人：${group.me.nickname || character.myName || '我'}（这是本设备的真人玩家，也是你本地私聊记忆中的主要互动对象）`
+        );
+    }
+
+    for (const other of (group.members || [])) {
+        if (!other || other.id === member.id) continue;
+
+        const name =
+            other.groupNickname ||
+            other.realName ||
+            '成员';
+
+        if (other.isHuman) {
+            otherParticipants.push(
+                `- 真人：${name}。这是独立真人参与者。你只能根据群聊里真实出现过的发言理解对方，绝不能替对方说话。`
+            );
+            continue;
+        }
+
+        const publicProfile =
+            String(
+                other.multiplayerPublicProfile ||
+                ''
+            ).trim();
+
+        otherParticipants.push(
+            `- 角色：${name}。${
+                publicProfile
+                    ? `对方主人公开给其他 AI 的“群内公开人设”如下：${publicProfile}`
+                    : '对方没有提供群内公开人设，你只能根据其公开发言逐渐认识对方。'
+            }`
+        );
+    }
+
+    prompt += `
+
+<multiplayer_group_override>
+【联机群聊模式：最高优先级，覆盖前文所有“一对一聊天”与“同时扮演多人”的冲突规则】
+
+你现在不是在和一个人私聊，而是在一个多人联机群“${group.name || '联机群'}”中。
+你这一次只允许扮演一个角色：${character.realName || member.realName}。
+
+1. 角色身份
+- 你只能作为 ${character.realName || member.realName} 思考和发言。
+- 必须继续完整遵守上文中的你自己的角色卡、世界书、长期记忆、Tavern 记忆、私聊经历和其他本地绑定设定。
+- 这些私有资料只属于你自己，不得把它们当作其他角色的人设。
+
+2. 其他参与者
+${otherParticipants.join('\n') || '- 当前没有其他参与者资料。'}
+
+3. 群内公开人设的边界
+- 其他角色的“群内公开人设”只用于帮助你理解对方。
+- 它不是你的角色设定，绝不能反向修改你自己的人设。
+- 你自己的“群内公开人设”不会提供给你，也不应影响你的生成。
+- 对方未公开的角色卡、世界书、私聊、隐藏设定和 Tavern 记忆，你并不知道，也不许自行编造为事实。
+
+4. 记忆互通
+- 你的私聊记忆、长期记忆、世界书和 Tavern 记忆与群聊经历属于同一个连续人生。
+- 你在群里可以自然记得私聊里发生过的事。
+- 你以后回到私聊，也会自然记得你亲自参加过的群聊经历。
+- 但私聊中的秘密是否主动说给群友听，必须由你根据角色性格、关系和情境自行决定，不能因为“记得”就自动泄露。
+
+${
+    privateHistory
+        ? `【你与本设备真人的近期私聊记录】
+以下内容只作为你的私人记忆背景，不是当前群里刚发生的消息：
+${privateHistory}
+`
+        : ''
+}
+
+5. 当前群聊记录
+- 系统接下来会把当前群最近的完整公开聊天记录作为聊天上下文传给你。
+- 记录中包含本设备真人、远程真人、你自己，以及其他角色的真实公开发言。
+- 你必须阅读所有人的消息，不是只读把你拉进群的那个人。
+- 你可以直接回应任何真人或其他角色。
+- 任何已经出现在记录里的其他角色发言都是真实发生过的；不要重写、改口或替他们补充台词。
+
+6. 绝对禁止代演
+- 禁止生成任何真人的台词。
+- 禁止生成任何其他角色的台词。
+- 禁止替其他角色描述其内心、决定、动作或隐藏设定。
+- 其他角色由其拥有者设备独立生成，你只能对他们已经公开说过的话作出反应。
+
+7. 本轮输出格式
+- 本轮只允许输出 ${character.realName || member.realName} 自己的普通聊天消息。
+- 每条消息必须严格写成：
+  [${character.realName || member.realName}的消息：内容]
+- 可以一次输出 1 到 4 条短消息，每条单独一行。
+- 不要输出“system”、旁白、心理分析、动作描写、其他人的台词或格式说明。
+- 即使上文的一对一模式允许转账、礼物、状态更新等特殊指令，在联机 V2.2 当前阶段也先不要使用这些特殊指令。
+
+8. OOC 控制
+- 你的语言、态度、价值判断、关系边界和反应逻辑必须以你自己的完整本地设定为最高依据。
+- 不要为了迎合群聊而突然改变核心性格。
+- 对不熟悉的人或角色，可以表现出不知道、误解、试探和逐渐熟悉，而不是凭空知道对方隐藏设定。
+</multiplayer_group_override>
+`;
+
+    if (
+        group.showNotice &&
+        group.notice &&
+        group.notice.trim()
+    ) {
+        prompt += `
+
+【当前群公告 / 公共背景】
+${group.notice.trim()}
+`;
+    }
+
+    return prompt;
+}
+
 function generateGroupSystemPrompt(group) {
+    const multiplayerTarget =
+        (typeof window !== 'undefined')
+            ? window.__uwuMultiplayerAiTarget
+            : null;
+
+    if (
+        group?.multiplayer?.enabled &&
+        multiplayerTarget &&
+        multiplayerTarget.groupId === group.id
+    ) {
+        return generateMultiplayerCharacterSystemPrompt(
+            group,
+            multiplayerTarget
+        );
+    }
+
     const worldBooksBefore = (group.worldBookIds || []).map(id => db.worldBooks.find(wb => wb.id === id && wb.position === 'before')).filter(Boolean).map(wb => wb.content).join('\n');
     const worldBooksAfter = (group.worldBookIds || []).map(id => db.worldBooks.find(wb => wb.id === id && wb.position === 'after')).filter(Boolean).map(wb => wb.content).join('\n');
 
