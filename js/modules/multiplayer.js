@@ -1,7 +1,7 @@
-// UwU Multiplayer V2 - Character Presence
-// 功能：真人联机 + 各自本地角色登记/展示。
-// 隐私原则：服务器只保存角色公开身份，不上传角色卡、人设、世界书、私聊或 Tavern 记忆。
-// 本阶段仍禁止联机群里的 AI 生成，下一阶段再接“各自设备只生成自己的角色”。
+// UwU Multiplayer V2.1 - Public Character Profiles
+// 功能：真人联机 + 各自本地角色登记/展示 + 联机公开人设。
+// 隐私原则：完整角色卡、人设、世界书、私聊与 Tavern 记忆只留本地。
+// 联机公开人设是独立字段：只作为其他设备 AI 理解该角色的上下文，不参与该角色本人生成。
 
 (() => {
     'use strict';
@@ -136,6 +136,52 @@
                 font:inherit;
                 background:#fff;
                 color:#222;
+            }
+
+            #uwu-mp-card textarea{
+                width:100%;
+                min-height:92px;
+                resize:vertical;
+                box-sizing:border-box;
+                padding:10px 11px;
+                border:1px solid #ddd;
+                border-radius:11px;
+                font:inherit;
+                line-height:1.5;
+                background:#fff;
+                color:#222;
+            }
+
+            .uwu-mp-profile-section{
+                margin-top:14px;
+                padding-top:12px;
+                border-top:1px solid #eee;
+            }
+
+            .uwu-mp-profile-note{
+                font-size:11px;
+                line-height:1.5;
+                color:#777;
+                margin:5px 0 10px;
+            }
+
+            .uwu-mp-profile-card{
+                border:1px solid #e8e8e8;
+                border-radius:12px;
+                padding:10px;
+                margin-top:9px;
+                background:#fafafa;
+            }
+
+            .uwu-mp-profile-name{
+                font-size:13px;
+                font-weight:700;
+                margin-bottom:6px;
+            }
+
+            .uwu-mp-profile-save{
+                width:100%;
+                margin-top:8px;
             }
 
             .uwu-mp-row{
@@ -287,6 +333,16 @@
                             断开
                         </button>
                     </div>
+
+                    <div class="uwu-mp-profile-section">
+                        <strong style="font-size:13px">联机角色公开人设</strong>
+                        <div class="uwu-mp-profile-note">
+                            这里只写“给对方 AI 理解角色用”的公开设定。
+                            你的角色本人生成时不会读取自己的这段内容；
+                            完整角色卡、世界书、私聊和酒馆记忆仍只留在本机。
+                        </div>
+                        <div id="uwu-mp-character-profiles"></div>
+                    </div>
                 </div>
 
                 <div id="uwu-mp-status">
@@ -375,9 +431,11 @@
 
         if (connected) {
             setStatus(
-                '已连接。真人消息和角色公开身份会实时同步；角色卡、人设、世界书与私聊仍只保存在各自设备。'
+                '已连接。真人消息、角色公开身份与“联机公开人设”会同步；完整角色卡、世界书、私聊与 Tavern 记忆仍只保存在各自设备。'
             );
         }
+
+        renderPublicProfileEditor();
     }
 
     async function waitForUwUReady(timeoutMs = 20000) {
@@ -875,6 +933,251 @@
         );
     }
 
+
+    function renderPublicProfileEditor() {
+        const root = $('uwu-mp-character-profiles');
+
+        if (!root) return;
+
+        root.innerHTML = '';
+
+        if (
+            !state.connected ||
+            !state.roomId ||
+            !state.groupId
+        ) {
+            return;
+        }
+
+        const group = getBoundGroup();
+        const localMembers =
+            getLocalCharacterMembers(group);
+
+        if (!localMembers.length) {
+            const empty =
+                document.createElement('div');
+
+            empty.className =
+                'uwu-mp-profile-note';
+
+            empty.textContent =
+                '先在这个群的设置里添加你自己的本地角色，之后这里会出现对应的公开人设编辑框。';
+
+            root.appendChild(empty);
+            return;
+        }
+
+        for (const member of localMembers) {
+            const card =
+                document.createElement('div');
+
+            card.className =
+                'uwu-mp-profile-card';
+
+            const name =
+                document.createElement('div');
+
+            name.className =
+                'uwu-mp-profile-name';
+
+            name.textContent =
+                member.groupNickname ||
+                member.realName ||
+                '角色';
+
+            const textarea =
+                document.createElement('textarea');
+
+            textarea.maxLength = 2000;
+            textarea.placeholder =
+                '例如：身份、公开性格、说话风格、外貌、与群友的公开关系。不要填秘密设定、世界书正文或私聊内容。';
+
+            textarea.value =
+                member.multiplayerPublicProfile ||
+                '';
+
+            const button =
+                document.createElement('button');
+
+            button.type = 'button';
+            button.className =
+                'uwu-mp-btn secondary uwu-mp-profile-save';
+
+            button.textContent =
+                '保存这名角色的公开人设';
+
+            button.addEventListener(
+                'click',
+                async () => {
+                    button.disabled = true;
+
+                    const oldText =
+                        button.textContent;
+
+                    button.textContent =
+                        '保存中…';
+
+                    try {
+                        await savePublicCharacterProfile(
+                            String(
+                                member.originalCharId
+                            ),
+                            textarea.value
+                        );
+
+                        button.textContent =
+                            '已保存';
+
+                        setTimeout(
+                            () => {
+                                button.textContent =
+                                    oldText;
+                                button.disabled =
+                                    false;
+                            },
+                            900
+                        );
+
+                    } catch (e) {
+                        console.error(
+                            '[Multiplayer] save public profile failed',
+                            e
+                        );
+
+                        button.textContent =
+                            '保存失败';
+                        button.disabled = false;
+
+                        toast(
+                            `公开人设保存失败：${e.message || e}`
+                        );
+                    }
+                }
+            );
+
+            card.append(
+                name,
+                textarea,
+                button
+            );
+
+            root.appendChild(card);
+        }
+    }
+
+    async function savePublicCharacterProfile(
+        sourceCharacterId,
+        publicProfile
+    ) {
+        if (
+            !state.roomId ||
+            !currentUser?.id
+        ) {
+            throw new Error(
+                '当前没有连接联机房间'
+            );
+        }
+
+        const group = getBoundGroup();
+
+        if (!group) {
+            throw new Error(
+                '没有找到当前联机群'
+            );
+        }
+
+        const member =
+            getLocalCharacterMembers(group)
+                .find(
+                    (item) =>
+                        String(
+                            item.originalCharId
+                        ) ===
+                        String(
+                            sourceCharacterId
+                        )
+                );
+
+        if (!member) {
+            throw new Error(
+                '这不是本机拥有的角色'
+            );
+        }
+
+        const cleanProfile =
+            String(publicProfile || '')
+                .trim()
+                .slice(0, 2000);
+
+        member.multiplayerPublicProfile =
+            cleanProfile;
+
+        await saveData();
+
+        // 用 upsert 保证刚拉进群、尚未完成第一次扫描的角色也能直接保存。
+        const publicName =
+            member.groupNickname ||
+            member.realName ||
+            '角色';
+
+        const {
+            data,
+            error
+        } = await client
+            .from('room_characters')
+            .upsert(
+                {
+                    room_id:
+                        state.roomId,
+
+                    source_character_id:
+                        String(
+                            member.originalCharId
+                        ),
+
+                    name:
+                        publicName,
+
+                    avatar_url:
+                        member.avatar ||
+                        null,
+
+                    public_profile:
+                        cleanProfile,
+
+                    created_by:
+                        currentUser.id,
+
+                    enabled:
+                        true,
+                },
+                {
+                    onConflict:
+                        'room_id,created_by,source_character_id'
+                }
+            )
+            .select(
+                'id,public_profile'
+            )
+            .single();
+
+        if (error) throw error;
+
+        member.multiplayerCharacterId =
+            data?.id ||
+            member.multiplayerCharacterId ||
+            null;
+
+        member.multiplayerPublicProfile =
+            data?.public_profile ||
+            cleanProfile;
+
+        await saveData();
+
+        // 对方通过 Realtime 会自动收到更新。
+        renderPublicProfileEditor();
+    }
+
     async function syncMembers() {
         if (!state.roomId) return;
 
@@ -981,7 +1284,7 @@
         } = await client
             .from('room_characters')
             .select(
-                'id,source_character_id,name,avatar_url,created_by'
+                'id,source_character_id,name,avatar_url,public_profile,created_by'
             )
             .eq(
                 'room_id',
@@ -1062,6 +1365,14 @@
                             member.avatar ||
                             null,
 
+                        public_profile:
+                            String(
+                                member.multiplayerPublicProfile ||
+                                ''
+                            )
+                                .trim()
+                                .slice(0, 2000),
+
                         created_by:
                             currentUser.id,
 
@@ -1077,7 +1388,7 @@
                     }
                 )
                 .select(
-                    'id,source_character_id,name,avatar_url,created_by'
+                    'id,source_character_id,name,avatar_url,public_profile,created_by'
                 )
                 .single();
 
@@ -1093,7 +1404,14 @@
                 null;
             member.multiplayerOwnerId =
                 currentUser.id;
+
+            member.multiplayerPublicProfile =
+                upserted?.public_profile ||
+                member.multiplayerPublicProfile ||
+                '';
         }
+
+        renderPublicProfileEditor();
     }
 
     async function syncCharacters({
@@ -1125,7 +1443,7 @@
             } = await client
                 .from('room_characters')
                 .select(
-                    'id,source_character_id,name,avatar_url,created_by,enabled,sort_order'
+                    'id,source_character_id,name,avatar_url,public_profile,created_by,enabled,sort_order'
                 )
                 .eq(
                     'room_id',
@@ -1181,6 +1499,11 @@
                         row.id;
                     member.multiplayerOwnerId =
                         currentUser.id;
+
+                    member.multiplayerPublicProfile =
+                        row.public_profile ||
+                        member.multiplayerPublicProfile ||
+                        '';
                 }
             }
 
@@ -1241,6 +1564,12 @@
 
                             multiplayerOwnerId:
                                 row.created_by,
+
+                            // 只供“其他设备的 AI”读取。
+                            // 不写入 persona，避免它变成原版角色卡的一部分。
+                            multiplayerPublicProfile:
+                                row.public_profile ||
+                                '',
                         })
                     );
 
@@ -1255,6 +1584,7 @@
                 );
 
             await saveData();
+            renderPublicProfileEditor();
 
             if (
                 typeof renderChatList ===
@@ -1915,6 +2245,10 @@
         syncMembers,
 
         syncMessages,
+
+        syncCharacters,
+
+        savePublicCharacterProfile,
     };
 
     if (
