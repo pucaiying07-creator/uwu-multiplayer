@@ -1,7 +1,7 @@
-// UwU Multiplayer V2.1 - Public Character Profiles
-// 功能：真人联机 + 各自本地角色登记/展示 + 联机公开人设。
+// UwU Multiplayer V2.2 - Local Character AI
+// 功能：真人联机 + 各自本地角色 + 联机公开人设 + 各设备只生成自己拥有的角色。
 // 隐私原则：完整角色卡、人设、世界书、私聊与 Tavern 记忆只留本地。
-// 联机公开人设是独立字段：只作为其他设备 AI 理解该角色的上下文，不参与该角色本人生成。
+// 服务器只同步公开消息、公开身份与“群内公开人设”，不同步隐藏上下文。
 
 (() => {
     'use strict';
@@ -27,6 +27,7 @@
     let syncingRemote = false;
     let characterSyncBusy = false;
     let localCharacterFingerprint = '';
+    let aiSyncStartedAt = 0;
 
     const $ = (id) => document.getElementById(id);
 
@@ -781,6 +782,11 @@
         await syncMembers();
         await syncCharacters({ pushLocal: true });
         await syncMessages();
+
+        // 只同步本次联机会话中新生成的本机 AI 消息，
+        // 避免升级/重连时把旧的本地群聊历史重新上传。
+        aiSyncStartedAt = Date.now();
+
         await saveData();
 
         if (
@@ -1662,7 +1668,7 @@
         } = await client
             .from('messages')
             .select(
-                'id,client_message_id,sender_kind,sender_user_id,sender_name,message_type,content,payload,created_at'
+                'id,client_message_id,sender_kind,sender_user_id,character_id,sender_name,message_type,content,payload,created_at'
             )
             .eq(
                 'room_id',
@@ -1734,7 +1740,8 @@
         }
 
         if (
-            row.sender_kind !== 'human'
+            row.sender_kind !== 'human' &&
+            row.sender_kind !== 'ai'
         ) {
             return;
         }
@@ -1743,15 +1750,60 @@
             row.sender_user_id ===
             currentUser?.id;
 
-        if (
-            !isMine &&
-            !group.members.some(
-                (m) =>
-                    m.remoteUserId ===
-                    row.sender_user_id
-            )
-        ) {
-            await syncMembers();
+        let senderId = null;
+
+        if (row.sender_kind === 'human') {
+            if (
+                !isMine &&
+                !group.members.some(
+                    (m) =>
+                        m.remoteUserId ===
+                        row.sender_user_id
+                )
+            ) {
+                await syncMembers();
+            }
+
+            senderId =
+                isMine
+                    ? 'user_me'
+                    : `human_${row.sender_user_id}`;
+
+        } else {
+            let sender =
+                (group.members || []).find(
+                    (m) =>
+                        m.multiplayerCharacterId ===
+                        row.character_id ||
+                        m.remoteCharacterId ===
+                        row.character_id
+                );
+
+            if (!sender) {
+                await syncCharacters({
+                    pushLocal: false
+                });
+
+                sender =
+                    (group.members || []).find(
+                        (m) =>
+                            m.multiplayerCharacterId ===
+                            row.character_id ||
+                            m.remoteCharacterId ===
+                            row.character_id
+                    );
+            }
+
+            if (!sender) {
+                console.warn(
+                    '[Multiplayer] AI message sender character not found',
+                    row
+                );
+
+                return;
+            }
+
+            senderId = sender.id;
         }
 
         const message = {
@@ -1759,7 +1811,7 @@
                 row.client_message_id,
 
             role:
-                isMine
+                row.sender_kind === 'human' && isMine
                     ? 'user'
                     : 'assistant',
 
@@ -1785,10 +1837,7 @@
                     ).getTime()
                     : Date.now(),
 
-            senderId:
-                isMine
-                    ? 'user_me'
-                    : `human_${row.sender_user_id}`,
+            senderId,
 
             multiplayerServerId:
                 row.id,
@@ -1796,8 +1845,23 @@
             multiplayerRemote:
                 !isMine,
 
+            multiplayerSynced:
+                true,
+
             multiplayerSenderKind:
-                'human',
+                row.sender_kind,
+
+            multiplayerCharacterId:
+                row.character_id ||
+                null,
+
+            quote:
+                row.payload?.quote ||
+                null,
+
+            storyTime:
+                row.payload?.storyTime ||
+                null,
         };
 
         syncingRemote = true;
@@ -1996,22 +2060,20 @@
             return;
         }
 
-        const candidates =
+        // ---- 1. 真人消息 ----
+        const humanCandidates =
             group.history.filter(
                 (m) =>
                     m.role === 'user' &&
                     m.id &&
                     !m.multiplayerSynced &&
+                    !m.multiplayerRemote &&
                     !m.fromTavern &&
                     m.role !== 'system'
             );
 
-        if (!candidates.length) {
-            return;
-        }
-
         for (
-            const msg of candidates
+            const msg of humanCandidates
         ) {
             const {
                 error
@@ -2029,6 +2091,9 @@
 
                     sender_user_id:
                         currentUser.id,
+
+                    character_id:
+                        null,
 
                     sender_name:
                         group.me?.nickname ||
@@ -2066,12 +2131,12 @@
                 }
 
                 console.error(
-                    '[Multiplayer] push message failed',
+                    '[Multiplayer] push human message failed',
                     error
                 );
 
                 setStatus(
-                    `消息同步失败：${error.message || error}`,
+                    `真人消息同步失败：${error.message || error}`,
                     true
                 );
 
@@ -2080,6 +2145,133 @@
 
             msg.multiplayerSynced =
                 true;
+
+            await saveData();
+        }
+
+        // ---- 2. 本机拥有角色的 AI 消息 ----
+        // 只同步本次联机会话开始后新生成的消息，避免把旧历史重新上传。
+        const aiCandidates =
+            group.history.filter(
+                (m) => {
+                    if (
+                        m.role !== 'assistant' ||
+                        !m.id ||
+                        m.multiplayerSynced ||
+                        m.multiplayerRemote ||
+                        m.isThinking ||
+                        m.isContextDisabled ||
+                        m.role === 'system'
+                    ) {
+                        return false;
+                    }
+
+                    if (
+                        aiSyncStartedAt &&
+                        Number(m.timestamp || 0) <
+                            aiSyncStartedAt - 1000
+                    ) {
+                        return false;
+                    }
+
+                    const sender =
+                        (group.members || []).find(
+                            member =>
+                                member.id === m.senderId &&
+                                member.isLocalCharacter &&
+                                !member.isRemoteCharacter &&
+                                member.multiplayerCharacterId
+                        );
+
+                    return Boolean(sender);
+                }
+            );
+
+        for (const msg of aiCandidates) {
+            const sender =
+                (group.members || []).find(
+                    member =>
+                        member.id === msg.senderId &&
+                        member.isLocalCharacter &&
+                        !member.isRemoteCharacter &&
+                        member.multiplayerCharacterId
+                );
+
+            if (!sender) continue;
+
+            const {
+                error
+            } = await client
+                .from('messages')
+                .insert({
+                    room_id:
+                        state.roomId,
+
+                    client_message_id:
+                        msg.id,
+
+                    sender_kind:
+                        'ai',
+
+                    sender_user_id:
+                        currentUser.id,
+
+                    character_id:
+                        sender.multiplayerCharacterId,
+
+                    sender_name:
+                        sender.groupNickname ||
+                        sender.realName ||
+                        '角色',
+
+                    message_type:
+                        msg.parts?.[0]?.type ||
+                        'text',
+
+                    content:
+                        msg.content ||
+                        '',
+
+                    payload: {
+                        quote:
+                            msg.quote ||
+                            null,
+
+                        storyTime:
+                            msg.storyTime ||
+                            null,
+                    },
+                });
+
+            if (error) {
+                if (
+                    String(error.code) ===
+                    '23505'
+                ) {
+                    msg.multiplayerSynced =
+                        true;
+                    continue;
+                }
+
+                console.error(
+                    '[Multiplayer] push AI message failed',
+                    error
+                );
+
+                setStatus(
+                    `角色消息同步失败：${error.message || error}`,
+                    true
+                );
+
+                return;
+            }
+
+            msg.multiplayerSynced =
+                true;
+            msg.multiplayerSenderKind =
+                'ai';
+            msg.multiplayerCharacterId =
+                sender.multiplayerCharacterId;
 
             await saveData();
         }
@@ -2103,6 +2295,7 @@
         scanTimer = null;
         characterScanTimer = null;
         localCharacterFingerprint = '';
+        aiSyncStartedAt = 0;
 
         state = {
             roomId: null,
@@ -2122,43 +2315,8 @@
     }
 
     function blockAiForHumanOnlyRoom() {
-        document.addEventListener(
-            'click',
-            (e) => {
-                const btn =
-                    e.target?.closest?.(
-                        '#get-reply-btn, #regenerate-btn'
-                    );
-
-                if (!btn) return;
-
-                const group =
-                    currentChatType === 'group'
-                        ? db.groups.find(
-                            (g) =>
-                                g.id ===
-                                currentChatId
-                        )
-                        : null;
-
-                if (
-                    !group?.multiplayer?.enabled
-                ) {
-                    return;
-                }
-
-                // V2 这一阶段只验证角色归属和双方可见性。
-                // 在“只生成自己角色”的 AI 链路完成前，
-                // 禁止沿用原版“一次扮演所有群角色”的逻辑。
-                e.preventDefault();
-                e.stopImmediatePropagation();
-
-                toast(
-                    '角色联机身份已经接入；AI 回复将在下一步启用，避免现在误替对方角色说话。'
-                );
-            },
-            true
-        );
+        // V2.2 已接入“各设备只生成自己拥有角色”的手动 AI 回复链路。
+        // 保留这个空函数只是为了兼容旧初始化代码，不再拦截 AI 按钮。
     }
 
     async function init() {
